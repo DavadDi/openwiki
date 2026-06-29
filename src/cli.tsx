@@ -95,6 +95,7 @@ type AppProps = {
 function App({ command }: AppProps) {
   const app = useApp();
   const startupModelId = command.kind === "run" ? command.modelId : null;
+  const autoExitOnSuccess = shouldAutoExitStartupRun(command);
   const [sessionModelId, setSessionModelId] = useState<string | null>(
     startupModelId,
   );
@@ -341,7 +342,12 @@ function App({ command }: AppProps) {
       app.exit();
       return;
     }
-  }, [app, runState.status]);
+
+    if (runState.status === "success" && autoExitOnSuccess) {
+      process.exitCode = 0;
+      app.exit();
+    }
+  }, [app, autoExitOnSuccess, runState.status]);
 
   if (command.kind === "help") {
     return <HelpView />;
@@ -426,6 +432,19 @@ function App({ command }: AppProps) {
   }
 
   if (runState.status === "success") {
+    if (autoExitOnSuccess) {
+      return (
+        <RunView
+          command={runState.result.command}
+          credentialDiagnostics={runState.credentialDiagnostics}
+          done
+          log={runState.log}
+          message={activeUserMessage}
+          modelId={runState.result.model}
+        />
+      );
+    }
+
     return (
       <Box flexDirection="column">
         <Header
@@ -2745,6 +2764,16 @@ function argvRequestsPrint(argv: string[]): boolean {
   return argv.some((arg) => arg === "-p" || arg === "--print");
 }
 
+function shouldAutoExitStartupRun(command: CliCommand): boolean {
+  return (
+    command.kind === "run" &&
+    !command.dryRun &&
+    !command.print &&
+    command.shouldStart &&
+    (command.command === "init" || command.command === "update")
+  );
+}
+
 async function runPrintCommand(
   command: Extract<CliCommand, { kind: "run" }>,
 ): Promise<void> {
@@ -2797,7 +2826,10 @@ function resolveStartupCommand(command: CliCommand): CliCommand {
     command.kind === "run" &&
     !command.dryRun &&
     command.shouldStart &&
-    (command.print || !process.stdin.isTTY)
+    (command.print ||
+      command.command === "init" ||
+      command.command === "update" ||
+      !process.stdin.isTTY)
   ) {
     const hasOpenRouterKey = Boolean(process.env[OPENROUTER_API_KEY_ENV_KEY]);
 
