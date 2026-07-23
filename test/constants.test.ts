@@ -1,25 +1,33 @@
 import { describe, expect, test } from "vitest";
 import {
+  BASETEN_BASE_URL_ENV_KEY,
   DEFAULT_MODEL_ID,
   DEFAULT_PROVIDER_RETRY_ATTEMPTS,
   DEFAULT_PROVIDER,
   DEFAULT_VERTEX_LOCATION,
   getDefaultModelId,
+  getProviderBaseUrlWarnings,
   getMissingProviderEnvKey,
   getProviderApiKeyEnvKey,
   getProviderModelOptions,
   getProviderRegionEnvKey,
+  FIREWORKS_BASE_URL_ENV_KEY,
   getProviderSecretKeyEnvKey,
+  getProvidersForKnownModelId,
+  isModelIdForOtherProvider,
   isValidBaseUrl,
+  isValidProviderBaseUrl,
   isValidModelId,
   isValidProvider,
   NEBIUS_BASE_URL,
+  NVIDIA_BASE_URL_ENV_KEY,
   normalizeModelId,
   normalizeProvider,
   providerRequiresApiKey,
   providerRequiresRegion,
   providerRequiresSecretKey,
   resolveConfiguredProvider,
+  resolveOpenRouterProviderOnly,
   resolveProviderBaseUrl,
   resolveProviderLocation,
   resolveProviderRegion,
@@ -33,6 +41,12 @@ describe("isValidModelId", () => {
     expect(isValidModelId("accounts/fireworks/models/glm-5p2")).toBe(true);
     expect(isValidModelId("gpt-5.4-mini")).toBe(true);
     expect(isValidModelId("nvidia/nemotron-3-super-120b-a12b")).toBe(true);
+  });
+
+  test("accepts Cloudflare Workers AI model ids with leading '@'", () => {
+    expect(isValidModelId("@cf/meta/llama-3-8b-instruct")).toBe(true);
+    expect(isValidModelId("@cf/moonshotai/kimi-k2.7-code")).toBe(true);
+    expect(isValidModelId("@cf/qwen/qwen1.5-14b-chat-awq")).toBe(true);
   });
 
   test("rejects empty, whitespace-only, and over-long ids", () => {
@@ -50,10 +64,11 @@ describe("isValidModelId", () => {
     expect(isValidModelId("claude-haiku-4-5@20251001")).toBe(true);
   });
 
-  test("rejects ids starting with a non-alphanumeric character", () => {
+  test("rejects ids starting with a disallowed non-alphanumeric character", () => {
     expect(isValidModelId("-leading-dash")).toBe(false);
     expect(isValidModelId("/leading-slash")).toBe(false);
-    expect(isValidModelId("@leading-at")).toBe(false);
+    // A leading "@" is intentionally allowed for Cloudflare Workers AI ids
+    // (covered above), so it is not rejected here.
   });
 
   test("normalizeModelId trims surrounding whitespace", () => {
@@ -157,11 +172,40 @@ describe("resolveProviderBaseUrl", () => {
     ).toBe("https://gateway.example/anthropic");
   });
 
+  test("prefers hosted OpenAI-compatible provider base URL overrides", () => {
+    expect(
+      resolveProviderBaseUrl("baseten", {
+        [BASETEN_BASE_URL_ENV_KEY]: "https://gateway.example/baseten/v1",
+      }),
+    ).toBe("https://gateway.example/baseten/v1");
+    expect(
+      resolveProviderBaseUrl("fireworks", {
+        [FIREWORKS_BASE_URL_ENV_KEY]: "https://gateway.example/fireworks/v1",
+      }),
+    ).toBe("https://gateway.example/fireworks/v1");
+    expect(
+      resolveProviderBaseUrl("nvidia", {
+        [NVIDIA_BASE_URL_ENV_KEY]: "https://gateway.example/nvidia/v1",
+      }),
+    ).toBe("https://gateway.example/nvidia/v1");
+  });
+
   test("ignores a whitespace-only override", () => {
     // anthropic has no built-in default, so a blank override resolves to undefined.
     expect(
       resolveProviderBaseUrl("anthropic", { ANTHROPIC_BASE_URL: "   " }),
     ).toBeUndefined();
+    expect(
+      resolveProviderBaseUrl("baseten", { [BASETEN_BASE_URL_ENV_KEY]: "   " }),
+    ).toBe("https://inference.baseten.co/v1");
+    expect(
+      resolveProviderBaseUrl("fireworks", {
+        [FIREWORKS_BASE_URL_ENV_KEY]: "   ",
+      }),
+    ).toBe("https://api.fireworks.ai/inference/v1");
+    expect(
+      resolveProviderBaseUrl("nvidia", { [NVIDIA_BASE_URL_ENV_KEY]: "   " }),
+    ).toBe("https://integrate.api.nvidia.com/v1");
   });
 
   test("returns undefined for a provider with no default and no override", () => {
@@ -200,6 +244,33 @@ describe("resolveProviderRetryAttempts", () => {
   });
 });
 
+describe("resolveOpenRouterProviderOnly", () => {
+  test("returns undefined when no provider pin is configured", () => {
+    expect(resolveOpenRouterProviderOnly({})).toBeUndefined();
+    expect(
+      resolveOpenRouterProviderOnly({
+        OPENWIKI_OPENROUTER_PROVIDER_ONLY: "   ",
+      }),
+    ).toBeUndefined();
+  });
+
+  test("normalizes a single provider name", () => {
+    expect(
+      resolveOpenRouterProviderOnly({
+        OPENWIKI_OPENROUTER_PROVIDER_ONLY: "  Novita  ",
+      }),
+    ).toEqual(["Novita"]);
+  });
+
+  test("normalizes a comma-separated provider allowlist", () => {
+    expect(
+      resolveOpenRouterProviderOnly({
+        OPENWIKI_OPENROUTER_PROVIDER_ONLY: "Novita, Fireworks,, Together",
+      }),
+    ).toEqual(["Novita", "Fireworks", "Together"]);
+  });
+});
+
 describe("isValidBaseUrl", () => {
   test("accepts http and https URLs", () => {
     expect(isValidBaseUrl("https://api.example.com/v1")).toBe(true);
@@ -211,6 +282,39 @@ describe("isValidBaseUrl", () => {
     expect(isValidBaseUrl("   ")).toBe(false);
     expect(isValidBaseUrl("not a url")).toBe(false);
     expect(isValidBaseUrl("ftp://example.com")).toBe(false);
+  });
+});
+
+describe("isValidProviderBaseUrl", () => {
+  test("accepts OpenAI-compatible API root URLs", () => {
+    expect(
+      isValidProviderBaseUrl(
+        "openai-compatible",
+        "https://gateway.example.com/v1",
+      ),
+    ).toBe(true);
+  });
+
+  test("rejects OpenAI-compatible chat completions endpoint URLs", () => {
+    expect(
+      isValidProviderBaseUrl(
+        "openai-compatible",
+        "https://gateway.example.com/v1/chat/completions",
+      ),
+    ).toBe(false);
+    expect(
+      getProviderBaseUrlWarnings(
+        "openai-compatible",
+        "https://gateway.example.com/v1/chat/completions/",
+      ),
+    ).toContain("use API root URL, not /chat/completions endpoint");
+  });
+
+  test("keeps generic http URL validation for other provider base URLs", () => {
+    expect(isValidProviderBaseUrl("anthropic", "not a url")).toBe(false);
+    expect(
+      getProviderBaseUrlWarnings("anthropic", "https://proxy.example.com"),
+    ).toEqual([]);
   });
 });
 
@@ -323,6 +427,21 @@ describe("resolveProviderLocation", () => {
   });
 });
 
+describe("getProviderModelOptions", () => {
+  test("offers the latest Gemini Flash models on both Gemini providers", () => {
+    const expectedModels = [
+      { id: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash-Lite" },
+      { id: "gemini-3.6-flash", label: "Gemini 3.6 Flash" },
+    ];
+
+    for (const provider of ["gemini", "gemini-enterprise"] as const) {
+      expect(getProviderModelOptions(provider)).toEqual(
+        expect.arrayContaining(expectedModels),
+      );
+    }
+  });
+});
+
 describe("getDefaultModelId", () => {
   test("returns the first model option for a provider", () => {
     expect(getDefaultModelId("anthropic")).toBe("claude-haiku-4-5");
@@ -330,8 +449,8 @@ describe("getDefaultModelId", () => {
     expect(getDefaultModelId("nvidia")).toBe(
       "nvidia/nemotron-3-super-120b-a12b",
     );
-    expect(getDefaultModelId("gemini")).toBe("gemini-3.5-flash");
-    expect(getDefaultModelId("gemini-enterprise")).toBe("gemini-3.5-flash");
+    expect(getDefaultModelId("gemini")).toBe("gemini-3.6-flash");
+    expect(getDefaultModelId("gemini-enterprise")).toBe("gemini-3.6-flash");
     expect(getDefaultModelId(DEFAULT_PROVIDER)).toBe(DEFAULT_MODEL_ID);
   });
 
@@ -345,4 +464,72 @@ describe("getDefaultModelId", () => {
       expect(getDefaultModelId("openai-compatible")).toBe(DEFAULT_MODEL_ID);
     },
   );
+});
+
+describe("getProvidersForKnownModelId", () => {
+  test("finds the provider(s) whose known models include the id", () => {
+    // claude-opus-4-8 is a known model of both anthropic and the
+    // gemini-enterprise gateway, which also serves Claude models.
+    expect(getProvidersForKnownModelId("claude-opus-4-8", "openai")).toEqual([
+      "anthropic",
+      "gemini-enterprise",
+    ]);
+  });
+
+  test("excludes the provider passed in", () => {
+    // Excluding anthropic still leaves gemini-enterprise, which also lists it.
+    expect(getProvidersForKnownModelId("claude-opus-4-8", "anthropic")).toEqual(
+      ["gemini-enterprise"],
+    );
+  });
+
+  test("uses exact matching, so namespaced overlaps do not false-match", () => {
+    // Anthropic's bare "claude-opus-4-8" must not match OpenRouter's
+    // namespaced "anthropic/claude-opus-4-8" or vice versa.
+    expect(
+      getProvidersForKnownModelId("anthropic/claude-opus-4-8", "openai"),
+    ).toEqual(["openrouter"]);
+    expect(
+      getProvidersForKnownModelId("anthropic/claude-opus-4-8", "openrouter"),
+    ).toEqual([]);
+  });
+
+  test("returns empty for custom / unknown model ids", () => {
+    expect(
+      getProvidersForKnownModelId("my-gateway-model", "openai-compatible"),
+    ).toEqual([]);
+  });
+});
+
+describe("isModelIdForOtherProvider", () => {
+  test("flags a model that clearly belongs to a different provider", () => {
+    expect(isModelIdForOtherProvider("claude-opus-4-8", "openai")).toBe(true);
+  });
+
+  test("does not flag a model that is valid for the configured provider", () => {
+    expect(isModelIdForOtherProvider("claude-opus-4-8", "anthropic")).toBe(
+      false,
+    );
+  });
+
+  test("does not flag shared OpenAI models across openai / openai-chatgpt", () => {
+    const [firstOpenAiModel] = getProviderModelOptions("openai");
+    if (firstOpenAiModel) {
+      expect(
+        isModelIdForOtherProvider(firstOpenAiModel.id, "openai-chatgpt"),
+      ).toBe(false);
+    }
+  });
+
+  test("does not flag custom / unknown model ids", () => {
+    expect(
+      isModelIdForOtherProvider("my-gateway-model", "openai-compatible"),
+    ).toBe(false);
+  });
+
+  test("trims whitespace before comparing", () => {
+    expect(isModelIdForOtherProvider("  claude-opus-4-8  ", "openai")).toBe(
+      true,
+    );
+  });
 });
