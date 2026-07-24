@@ -330,8 +330,10 @@ async function runOpenWikiAgentCore(
     );
 
     // Persist metadata even when the stream fails late, so content that was
-    // already generated stays diffable by future updates. Persistence errors
-    // are swallowed here so the original run error propagates.
+    // already generated stays diffable by future updates. The run is recorded
+    // as interrupted so the next update is not skipped as a no-op against a
+    // possibly partial wiki. Persistence errors are swallowed here so the
+    // original run error propagates.
     try {
       const metadataWritten = await persistRunMetadataIfChanged(
         command,
@@ -339,6 +341,7 @@ async function runOpenWikiAgentCore(
         modelId,
         outputMode,
         openWikiSnapshotBefore,
+        "interrupted",
       );
       emitDebug(
         options,
