@@ -1,3 +1,10 @@
+---
+type: Technical documentation
+title: Agent workflow
+description: Explains the OpenWiki documentation agent's command flow, provider and model setup, prompting rules, and update metadata behavior. Documents the agent's Git-grounded workflow, content snapshot safeguards, and source implementation map for maintaining agent behavior.
+tags: [agent, workflow, documentation, providers, update-metadata]
+---
+
 # Agent workflow
 
 The documentation agent is implemented in `src/agent/`. It takes a command (`chat`, `init`, or `update`), gathers repository context, builds prompts, runs a DeepAgents session, and records successful update metadata — but only if the documentation content actually changed.
@@ -23,11 +30,18 @@ Chat runs skip metadata writes entirely.
 
 `createModel()` in `src/agent/index.ts` branches by provider:
 
+- **gemini**: `new ChatGoogle({ apiKey, model, platformType: "gai" })` — uses the Gemini API key against Google AI Studio. Includes Gemini 3.x thought-signature round-trip options.
+- **gemini-enterprise**: calls `createGeminiEnterpriseModel()`, which routes by model family via `resolveVertexSurface()` in `src/agent/vertex-surface.ts`. Claude models → `ChatAnthropic` with a custom `AnthropicVertex` client (`@anthropic-ai/vertex-sdk`, ADC-authenticated, env neutralized around the constructor so a stray `ANTHROPIC_API_KEY` cannot clobber the Google OAuth token). Partner/open-weight models (Llama, Mistral, DeepSeek, Qwen) → `ChatOpenAI` against Vertex's OpenAI-compatible MaaS endpoint with a per-request ADC auth fetch. Gemini/Gemma models → `ChatGoogle` with ADC and `apiKey: ""` to block `GOOGLE_API_KEY` fallback. Auth is uniform Google ADC; `GOOGLE_CLOUD_PROJECT` is required and `GOOGLE_CLOUD_LOCATION` is optional (defaults to `global`).
 - **anthropic**: `new ChatAnthropic(modelId, { apiKey, anthropicApiUrl? })` — uses `@langchain/anthropic` directly. When `ANTHROPIC_BASE_URL` is set, the resolved alternative base URL is passed as `anthropicApiUrl` so requests can be routed to a self-hosted or proxied Anthropic-compatible endpoint instead of the default API.
-- **openrouter**: `new ChatOpenRouter({ apiKey, baseURL, model, models, route: "fallback", siteName: "OpenWiki" })` — passes a fallback model list so OpenRouter can route around server-side failures.
-- **baseten / fireworks / openai / openai-compatible**: `new ChatOpenAI({ apiKey, configuration: { baseURL? }, model })` — OpenAI-compatible clients using the provider's base URL when configured. The `openai-compatible` provider has no default endpoint; its base URL is user-supplied via `OPENAI_COMPATIBLE_BASE_URL` and required (`requiresBaseUrl: true`), which lets OpenWiki target any OpenAI-compatible gateway (for example a LiteLLM gateway fronting upstream providers).
+- **openai-chatgpt**: `new ChatOpenAI({ apiKey: tokens.access, model, useResponsesApi: true, zdrEnabled: true, streaming: true, configuration: { baseURL: CODEX_RESPONSES_BASE_URL, defaultHeaders, fetch } })` — uses ChatGPT OAuth tokens instead of an API key. Tokens are refreshed before model creation via `ensureFreshChatGptTokens()` in `src/agent/openai-chatgpt-oauth.ts`. The Codex backend requires `store: false` (`zdrEnabled`) and streaming for all requests. If tokens are missing, the run aborts with a clear message directing the user to sign in.
+- **openrouter**: `new ChatOpenRouter({ apiKey, baseURL, model, siteName: "OpenWiki" })` — uses the selected OpenRouter model directly.
+- **bedrock**: `new ChatBedrockConverse({ credentials: { accessKeyId, secretAccessKey }, model, region })` — uses `@langchain/aws` Bedrock Converse API with AWS credentials and a required region.
+- **openai**: `new ChatOpenAI({ apiKey, model, useResponsesApi: true })` — uses OpenAI's Responses API for official OpenAI calls.
+- **baseten / fireworks / nebius / nvidia / openai-compatible**: `new ChatOpenAI({ apiKey, configuration: { baseURL? }, model })` — OpenAI-compatible clients using the provider's base URL when configured. The `openai-compatible` provider has no default endpoint; its base URL is user-supplied via `OPENAI_COMPATIBLE_BASE_URL` and required (`requiresBaseUrl: true`), which lets OpenWiki target any OpenAI-compatible gateway (for example a LiteLLM gateway fronting upstream providers).
 
 Base URLs are resolved through `resolveProviderBaseUrl()` in `src/constants.ts`, which prefers a provider's alternative base URL environment variable (`baseUrlEnvKey`) over the built-in default before falling back to the SDK's own default endpoint. Providers marked `requiresBaseUrl` are validated at startup by `ensureProviderBaseUrl()`.
+
+Provider retry attempts are resolved through `resolveProviderRetryAttempts()` and passed to the LangChain model client's `maxRetries` option. The value is the number of retries after the first provider request; unset values default to 3 retries.
 
 ## Prompting strategy
 
@@ -49,6 +63,32 @@ The user prompt changes with the command:
 - `init` includes the current Git summary and asks for fresh documentation.
 - `update` includes last update metadata and a Git change summary.
 - `chat` just forwards the user message.
+
+### Local brain open questions
+
+Local brain runs use `~/.openwiki/wiki/open-questions.md` as a compact queue for uncertainty about the user's wiki or core memory model, not as a place to copy unresolved questions from every source document. Good open questions are things that would impair future assistance, such as unclear recurring routines, missing locations, uncertain preferences, ambiguous people/org relationships, or contradictions between sources.
+
+Do not add an open question merely because a Notion spec, meeting note, email thread, or source page contains open product/design questions. Keep those on source pages, `themes.md`, or `commitments.md` unless they are explicitly owned by the user or reveal a gap in the user's memory graph. Group similar questions under one topic key instead of creating many same-project entries.
+
+The file should use three sections:
+
+- `Active`: unresolved questions with `Owner`, `Seen`, `Evidence`, and optional `Notes`.
+- `Answered`: previously open questions with `Evidence` linking to the canonical answer or source evidence, plus `Answered`.
+- `Stale`: dropped questions with `Why` and `Last seen`.
+
+The agent should read `open-questions.md` at the start of each local-wiki run when it exists, use the run's evidence to answer known questions, and return to the file at the end to add new unresolved questions or move answered ones out of `Active`. Answered entries should link to the answer evidence rather than duplicating an answer summary that can drift.
+
+### Local brain themes
+
+Local brain runs use `themes.md` as a compact trend index, not as a narrative page. Prefer a Markdown table with `Topic key`, `Theme/Signal`, `First seen`, `Last seen`, `Confidence`, `Sources`, `Evidence count`, `Status`, and `Evidence`. If a table is too cramped, use one short fielded entry per theme.
+
+Each theme should have at most 1-2 short sentences of prose. Keep detailed examples, long context, source-specific item lists, and tweet/feed clusters in `sources/<connector>.md`, then link to that evidence from the theme row. Watchlist entries should be especially terse.
+
+### Local brain commitments and logistics
+
+Local brain runs use `commitments.md` for work commitments, follow-ups, approvals, deadlines, and scheduled work items. Entries should include `Owner` when inferable from evidence: `me`, `team`, `other:<name>`, or `unknown`.
+
+Use `personal-logistics.md` for non-work personal items such as appointments, pickups, travel, household tasks, and life-admin deadlines. Personal logistics should not be mixed into `commitments.md` unless they are also work commitments.
 
 ## Git evidence and update metadata
 
@@ -73,15 +113,9 @@ That metadata is later used to scope update runs.
 
 `createOpenWikiContentSnapshot()` computes a SHA-256 hash of the entire `openwiki/` directory tree (excluding `.last-update.json`). The agent runtime takes a snapshot before and after the run. If they match — meaning the model made no documentation changes — the metadata file is not updated. This prevents scheduled update loops from churning the metadata when the wiki is already current.
 
-## Model fallback and retries
+## Model errors
 
-The agent runtime includes a retry strategy for OpenRouter:
-
-- the selected model is tried first,
-- server-side OpenRouter failures (HTTP 5xx) fall back through `OPENROUTER_FALLBACK_MODEL_IDS`,
-- retries keep the same command and repository context but use a modified thread ID to avoid checkpointer collisions.
-
-Non-OpenRouter providers do not use the fallback list — only the selected model is attempted.
+The agent runtime uses only the selected provider and model for a run. Transient request failures use the LangChain model client's retry handling, configurable with `OPENWIKI_PROVIDER_RETRY_ATTEMPTS`. If the selected provider/model still fails, OpenWiki surfaces the provider error and stops instead of retrying with another model.
 
 ## Why this matters
 
@@ -99,8 +133,8 @@ The agent is not just a generic chat wrapper. It is intentionally constrained so
 - Be careful with `.last-update.json` semantics, because update runs use it to decide what changed since the previous successful run.
 - The content-snapshot check means a no-op update will not update metadata. If you change the snapshot logic, ensure `.last-update.json` is still excluded.
 - Credential loading happens before model resolution; changes there affect both onboarding and agent startup.
-- When adding a provider, add a branch in `createModel()` and ensure the API key env key is checked in `ensureProviderKey()`.
-- The DeepAgents backend is configured with `virtualMode: true`, which is important for documentation-only behavior.
+- When adding a provider, add a branch in `createModel()` and ensure the API key env key is checked in `ensureProviderKey()`. OAuth-based providers (like `openai-chatgpt`) skip `ensureProviderKey()` and instead require a token refresh step before `createModel()` is called. Providers without an API key (like `gemini-enterprise`) declare their required env keys (e.g. `projectEnvKey`) in `PROVIDER_CONFIGS` and are gated by `getMissingProviderEnvKey()` instead.
+- The DeepAgents backend is configured with `virtualMode: true`, which is important for documentation-only behavior. The custom `OpenWikiLocalShellBackend` in `src/agent/docs-only-backend.ts` adds docs-only write guards that restrict writes to the `openwiki/` directory in docs-only mode.
 
 ## Source map
 
@@ -108,6 +142,8 @@ The agent is not just a generic chat wrapper. It is intentionally constrained so
 - `src/agent/prompt.ts`
 - `src/agent/utils.ts`
 - `src/agent/types.ts`
+- `src/agent/docs-only-backend.ts`
+- `src/agent/openai-chatgpt-oauth.ts`
 - `src/constants.ts`
 - `src/env.ts`
 - Git evidence: commits `ceded10`, `f89b05d`, `dfa73cc`, `a82759f`, `0fa1430`
